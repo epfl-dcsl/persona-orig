@@ -10,6 +10,7 @@ from common.parse import numeric_min_checker, yes_or_no
 from tensorflow.python.ops import data_flow_ops, string_ops
 from tensorflow.python.framework import tensor_shape, dtypes
 from tensorflow.python.training import queue_runner
+from functools import partial
 
 persona_ops = tf.contrib.persona.persona_ops()
 from tensorflow.contrib.persona import queues, pipeline
@@ -50,7 +51,7 @@ class ImportFastqService(Service):
         parser.add_argument("-o", "--out", default=".", help="directory to write the final record to")
         parser.add_argument("-w", "--write", default=1, type=numeric_min_checker(1, "write parallelism"), help="number of parallel writers")
         parser.add_argument("--paired", default=False, action='store_true', help="interpret fastq files as paired, requires an even number of files for positional args fastq_files")
-        parser.add_argument("--compress-parallel", default=1, type=numeric_min_checker(1, "compress parallelism"), help="number of parallel compression pipelines")
+        parser.add_argument("--compress-parallel", default=1, type=numeric_min_checker(0, "compress parallelism"), help="number of parallel compression pipelines")
         parser.add_argument("fastq_files", nargs="+", help="the fastq file to convert")
 
     def add_run_args(self, parser):
@@ -97,10 +98,12 @@ class ImportFastqService(Service):
         converters = tuple(conversion_pipeline(queued_fastq=reader, chunk_size=args.chunk,
                                                convert_parallelism=args.parallel_conversion, args=args))
 
-        compressors = tuple(compress_pipeline(converters=converters, compress_parallelism=args.compress_parallel))
+        if args.compress_parallel > 0:
+            compressors = tuple(compress_pipeline(converters=converters, compress_parallelism=args.compress_parallel))
+        else:
+            compressors = converters
 
-        writers = tuple(writer_pipeline(compressors, args.write, args.name, self.outdir))
-        #final = pipeline.join(upstream_tensors=writers, capacity=8, parallel=1, multi=True)[0]
+        writers = tuple(writer_pipeline(compressors, args.write, args.name, self.outdir, compressed=args.compress_parallel > 0))
 
         return writers, []
     
@@ -151,36 +154,38 @@ def compress_pipeline(converters, compress_parallelism):
         yield base_buf, qual_buf, meta_buf, first_ord, num_recs
 
 
-def writer_pipeline(compressors, write_parallelism, record_id, output_dir):
+def writer_pipeline(compressors, write_parallelism, record_id, output_dir, compressed):
     prefix_name = tf.constant("{}_".format(record_id), name="prefix_string")
     compressed_batch = pipeline.join(compressors, parallel=write_parallelism, capacity=8, multi=True, name="write_input")
+
+    if compressed:
+        write_op = partial(persona_ops.agd_file_system_buffer_writer, compressed=compressed)
+    else:
+        write_op = persona_ops.agd_file_system_buffer_pair_writer
 
     for base, qual, meta, first_ordinal, num_recs in compressed_batch:
         first_ord_as_string = string_ops.as_string(first_ordinal, name="first_ord_as_string")
         base_key = string_ops.string_join([output_dir, prefix_name, first_ord_as_string, ".base"], name="base_key_string")
         qual_key = string_ops.string_join([output_dir, prefix_name, first_ord_as_string, ".qual"], name="qual_key_string")
         meta_key = string_ops.string_join([output_dir, prefix_name, first_ord_as_string, ".metadata"], name="metadata_key_string")
-        base_path = persona_ops.agd_file_system_buffer_writer(record_id=record_id,
-                                                     record_type="base_compact",
-                                                     resource_handle=base,
-                                                     path=base_key,
-                                                     compressed=True,
-                                                     first_ordinal=first_ordinal,
-                                                     num_records=tf.to_int32(num_recs))
-        qual_path = persona_ops.agd_file_system_buffer_writer(record_id=record_id,
-                                                     record_type="text",
-                                                     resource_handle=qual,
-                                                     path=qual_key,
-                                                     compressed=True,
-                                                     first_ordinal=first_ordinal,
-                                                     num_records=tf.to_int32(num_recs))
-        meta_path = persona_ops.agd_file_system_buffer_writer(record_id=record_id,
-                                                     record_type="text",
-                                                     resource_handle=meta,
-                                                     path=meta_key,
-                                                     compressed=True,
-                                                     first_ordinal=first_ordinal,
-                                                     num_records=tf.to_int32(num_recs))
+        base_path = write_op(record_id=record_id,
+                             record_type="base_compact",
+                             resource_handle=base,
+                             path=base_key,
+                             first_ordinal=first_ordinal,
+                             num_records=tf.to_int32(num_recs))
+        qual_path = write_op(record_id=record_id,
+                             record_type="text",
+                             resource_handle=qual,
+                             path=qual_key,
+                             first_ordinal=first_ordinal,
+                             num_records=tf.to_int32(num_recs))
+        meta_path = write_op(record_id=record_id,
+                             record_type="text",
+                             resource_handle=meta,
+                             path=meta_key,
+                             first_ordinal=first_ordinal,
+                             num_records=tf.to_int32(num_recs))
         yield base_path, qual_path, meta_path, first_ordinal, num_recs
 
 def conversion_pipeline(queued_fastq, chunk_size, convert_parallelism, args):
