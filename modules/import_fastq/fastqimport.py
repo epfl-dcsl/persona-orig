@@ -156,16 +156,18 @@ def compress_pipeline(converters, compress_parallelism):
 
 def writer_pipeline(compressors, write_parallelism, record_id, output_dir, compressed):
     prefix_name = tf.constant("{}_".format(record_id), name="prefix_string")
-    converted_compressors = [
-        [a.compressed_buffer for a in result_item[:3]] + list(result_item[3:])
-        for result_item in compressors
-    ]
-    compressed_batch = pipeline.join(converted_compressors, parallel=write_parallelism, capacity=8, multi=True, name="write_input")
 
     if compressed:
         write_op = partial(persona_ops.agd_file_system_buffer_writer, compressed=compressed)
+        converted_compressors = [
+            [a.compressed_buffer for a in result_item[:3]] + list(result_item[3:])
+            for result_item in compressors
+        ]
     else:
         write_op = persona_ops.agd_file_system_buffer_pair_writer
+        converted_compressors = compressors
+
+    compressed_batch = pipeline.join(converted_compressors, parallel=write_parallelism, capacity=8, multi=True, name="write_input")
 
     for base, qual, meta, first_ordinal, num_recs in compressed_batch:
         first_ord_as_string = string_ops.as_string(first_ordinal, name="first_ord_as_string")
